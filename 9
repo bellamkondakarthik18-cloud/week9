@@ -1,0 +1,533 @@
+// ---------------------------------------------------------------------------
+// pubspec.yaml
+//
+//   dependencies:
+//     flutter:
+//       sdk: flutter
+//     http: ^1.2.0
+//
+// Then run:  flutter pub get
+//
+// Platform notes:
+//  - Android: add  <uses-permission android:name="android.permission.INTERNET"/>
+//    to android/app/src/main/AndroidManifest.xml (debug builds already have it).
+//  - macOS: enable the "com.apple.security.network.client" entitlement.
+//
+// API used: https://jsonplaceholder.typicode.com (a free fake REST API; it
+// accepts POST/PUT/DELETE but does not actually save anything).
+// ---------------------------------------------------------------------------
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'REST API Demo',
+      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+      home: const PostsPage(),
+    );
+  }
+}
+
+// ===========================================================================
+// 1. MODEL: converts between JSON (Map) and Dart objects
+// ===========================================================================
+class Post {
+  final int id;
+  final int userId;
+  final String title;
+  final String body;
+
+  const Post({
+    required this.id,
+    required this.userId,
+    required this.title,
+    required this.body,
+  });
+
+  // JSON -> Post
+  factory Post.fromJson(Map<String, dynamic> json) => Post(
+        id: json['id'] as int? ?? 0,
+        userId: json['userId'] as int? ?? 0,
+        title: json['title'] as String? ?? '',
+        body: json['body'] as String? ?? '',
+      );
+
+  // Post -> JSON
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'userId': userId,
+        'title': title,
+        'body': body,
+      };
+
+  Post copyWith({String? title, String? body}) => Post(
+        id: id,
+        userId: userId,
+        title: title ?? this.title,
+        body: body ?? this.body,
+      );
+
+  /// JSONPlaceholder only has posts 1-100. Posts we "create" get id 101 but
+  /// don't really exist on the server, so we treat them as local-only.
+  bool get isLocalOnly => id > 100;
+}
+
+// ===========================================================================
+// 2. SERVICE: all HTTP code lives here (UI never touches http directly)
+// ===========================================================================
+class ApiException implements Exception {
+  final String message;
+  final int? statusCode;
+  const ApiException(this.message, [this.statusCode]);
+
+  @override
+  String toString() => message;
+}
+
+class PostService {
+  PostService({http.Client? client}) : _client = client ?? http.Client();
+
+  final http.Client _client; // injectable -> easy to mock in tests
+
+  static const _baseUrl = 'https://jsonplaceholder.typicode.com';
+  static const _headers = {'Content-Type': 'application/json; charset=UTF-8'};
+  static const _timeout = Duration(seconds: 10);
+
+  // GET /posts?_limit=20   (query parameters)
+  Future<List<Post>> fetchPosts({int limit = 20}) async {
+    final uri = Uri.parse('$_baseUrl/posts').replace(
+      queryParameters: {'_limit': '$limit'},
+    );
+    final res = await _send(() => _client.get(uri));
+    final list = _decode(res) as List<dynamic>;
+    return list.map((e) => Post.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
+  // GET /posts/1   (path parameter)
+  Future<Post> fetchPost(int id) async {
+    final res = await _send(() => _client.get(Uri.parse('$_baseUrl/posts/$id')));
+    return Post.fromJson(_decode(res) as Map<String, dynamic>);
+  }
+
+  // POST /posts   (create; send JSON body)
+  Future<Post> createPost({required String title, required String body}) async {
+    final res = await _send(
+      () => _client.post(
+        Uri.parse('$_baseUrl/posts'),
+        headers: _headers,
+        body: jsonEncode({'title': title, 'body': body, 'userId': 1}),
+      ),
+    );
+    return Post.fromJson(_decode(res) as Map<String, dynamic>);
+  }
+
+  // PUT /posts/1   (replace/update)
+  Future<Post> updatePost(Post post) async {
+    if (post.isLocalOnly) return post; // nothing to update on the server
+    final res = await _send(
+      () => _client.put(
+        Uri.parse('$_baseUrl/posts/${post.id}'),
+        headers: _headers,
+        body: jsonEncode(post.toJson()),
+      ),
+    );
+    return Post.fromJson(_decode(res) as Map<String, dynamic>);
+  }
+
+  // DELETE /posts/1
+  Future<void> deletePost(Post post) async {
+    if (post.isLocalOnly) return;
+    await _send(() => _client.delete(Uri.parse('$_baseUrl/posts/${post.id}')));
+  }
+
+  /// Runs a request with a timeout and converts every failure mode into a
+  /// friendly ApiException.
+  Future<http.Response> _send(Future<http.Response> Function() request) async {
+    try {
+      final res = await request().timeout(_timeout);
+      if (res.statusCode >= 200 && res.statusCode < 300) return res;
+
+      throw ApiException(
+        switch (res.statusCode) {
+          404 => 'Not found (404)',
+          >= 500 => 'Server error (${res.statusCode})',
+          _ => 'Request failed (${res.statusCode})',
+        },
+        res.statusCode,
+      );
+    } on TimeoutException {
+      throw const ApiException('The request timed out. Please try again.');
+    } on http.ClientException {
+      throw const ApiException('Could not connect. Check your internet connection.');
+    }
+  }
+
+  dynamic _decode(http.Response res) {
+    try {
+      return jsonDecode(utf8.decode(res.bodyBytes));
+    } on FormatException {
+      throw const ApiException('Received invalid data from the server.');
+    }
+  }
+}
+
+// ===========================================================================
+// 3. LIST SCREEN: loading / error / data states + CRUD
+// ===========================================================================
+enum LoadStatus { loading, success, error }
+
+class PostsPage extends StatefulWidget {
+  const PostsPage({super.key});
+
+  @override
+  State<PostsPage> createState() => _PostsPageState();
+}
+
+class _PostsPageState extends State<PostsPage> {
+  final _service = PostService();
+
+  LoadStatus _status = LoadStatus.loading;
+  List<Post> _posts = [];
+  String _error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _status = LoadStatus.loading);
+    try {
+      final posts = await _service.fetchPosts();
+      if (!mounted) return; // widget may have been disposed during the await
+      setState(() {
+        _posts = posts;
+        _status = LoadStatus.success;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _status = LoadStatus.error;
+      });
+    }
+  }
+
+  void _snack(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
+      ));
+  }
+
+  Future<void> _create() async {
+    final result = await showDialog<(String, String)>(
+      context: context,
+      builder: (_) => const PostFormDialog(title: 'New post'),
+    );
+    if (result == null) return;
+
+    try {
+      final created = await _service.createPost(title: result.$1, body: result.$2);
+      if (!mounted) return;
+      setState(() => _posts.insert(0, created));
+      _snack('Created post #${created.id}');
+    } on ApiException catch (e) {
+      _snack(e.message, isError: true);
+    }
+  }
+
+  Future<void> _delete(Post post, int index) async {
+    // Optimistic update: remove first, restore if the API call fails
+    setState(() => _posts.removeAt(index));
+    try {
+      await _service.deletePost(post);
+      _snack('Deleted post #${post.id}');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _posts.insert(index, post));
+      _snack('Delete failed: ${e.message}', isError: true);
+    }
+  }
+
+  void _replace(Post updated) {
+    final i = _posts.indexWhere((p) => p.id == updated.id);
+    if (i != -1) setState(() => _posts[i] = updated);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Posts (REST API)')),
+      body: switch (_status) {
+        LoadStatus.loading => const Center(child: CircularProgressIndicator()),
+        LoadStatus.error => ErrorView(message: _error, onRetry: _load),
+        LoadStatus.success => RefreshIndicator(
+            onRefresh: _load, // pull-to-refresh
+            child: _posts.isEmpty
+                ? ListView(children: const [
+                    SizedBox(height: 200, child: Center(child: Text('No posts'))),
+                  ])
+                : ListView.separated(
+                    itemCount: _posts.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, i) {
+                      final post = _posts[i];
+                      return Dismissible(
+                        key: ValueKey(post.id),
+                        direction: DismissDirection.endToStart,
+                        background: Container(
+                          color: Colors.red,
+                          alignment: Alignment.centerRight,
+                          padding: const EdgeInsets.only(right: 20),
+                          child: const Icon(Icons.delete, color: Colors.white),
+                        ),
+                        onDismissed: (_) => _delete(post, i),
+                        child: ListTile(
+                          leading: CircleAvatar(child: Text('${post.id}')),
+                          title: Text(post.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          subtitle: Text(post.body, maxLines: 2, overflow: TextOverflow.ellipsis),
+                          onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => PostDetailPage(
+                                post: post,
+                                service: _service,
+                                onUpdated: _replace,
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+      },
+      floatingActionButton: FloatingActionButton(
+        onPressed: _create,
+        child: const Icon(Icons.add),
+      ),
+    );
+  }
+}
+
+// ===========================================================================
+// 4. DETAIL SCREEN: FutureBuilder + PUT
+// ===========================================================================
+class PostDetailPage extends StatefulWidget {
+  final Post post;
+  final PostService service;
+  final ValueChanged<Post> onUpdated;
+
+  const PostDetailPage({
+    super.key,
+    required this.post,
+    required this.service,
+    required this.onUpdated,
+  });
+
+  @override
+  State<PostDetailPage> createState() => _PostDetailPageState();
+}
+
+class _PostDetailPageState extends State<PostDetailPage> {
+  late Future<Post> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetch();
+  }
+
+  // Create the Future once (never inside build, or it refetches on every rebuild)
+  void _fetch() {
+    _future = widget.post.isLocalOnly
+        ? Future.value(widget.post)
+        : widget.service.fetchPost(widget.post.id);
+  }
+
+  Future<void> _edit(Post current) async {
+    final result = await showDialog<(String, String)>(
+      context: context,
+      builder: (_) => PostFormDialog(
+        title: 'Edit post',
+        initialTitle: current.title,
+        initialBody: current.body,
+      ),
+    );
+    if (result == null) return;
+
+    try {
+      final updated = await widget.service.updatePost(
+        current.copyWith(title: result.$1, body: result.$2),
+      );
+      if (!mounted) return;
+      widget.onUpdated(updated);
+      setState(() => _future = Future.value(updated));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Post updated')));
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(e.message),
+        backgroundColor: Theme.of(context).colorScheme.error,
+      ));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Post>(
+      future: _future,
+      builder: (context, snapshot) {
+        final post = snapshot.data;
+
+        return Scaffold(
+          appBar: AppBar(
+            title: Text('Post #${widget.post.id}'),
+            actions: [
+              if (post != null)
+                IconButton(icon: const Icon(Icons.edit), onPressed: () => _edit(post)),
+            ],
+          ),
+          body: switch (snapshot.connectionState) {
+            ConnectionState.waiting => const Center(child: CircularProgressIndicator()),
+            _ when snapshot.hasError => ErrorView(
+                message: snapshot.error.toString(),
+                onRetry: () => setState(_fetch),
+              ),
+            _ => Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(post!.title, style: Theme.of(context).textTheme.headlineSmall),
+                    const SizedBox(height: 12),
+                    Text(post.body, style: Theme.of(context).textTheme.bodyLarge),
+                    const SizedBox(height: 24),
+                    Text('User ID: ${post.userId}',
+                        style: Theme.of(context).textTheme.labelLarge),
+                  ],
+                ),
+              ),
+          },
+        );
+      },
+    );
+  }
+}
+
+// ===========================================================================
+// 5. SHARED WIDGETS
+// ===========================================================================
+class ErrorView extends StatelessWidget {
+  final String message;
+  final VoidCallback onRetry;
+
+  const ErrorView({super.key, required this.message, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.error_outline, size: 56, color: Theme.of(context).colorScheme.error),
+            const SizedBox(height: 12),
+            Text(message, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Dialog with two fields. Returns (title, body) or null if cancelled.
+class PostFormDialog extends StatefulWidget {
+  final String title;
+  final String initialTitle;
+  final String initialBody;
+
+  const PostFormDialog({
+    super.key,
+    required this.title,
+    this.initialTitle = '',
+    this.initialBody = '',
+  });
+
+  @override
+  State<PostFormDialog> createState() => _PostFormDialogState();
+}
+
+class _PostFormDialogState extends State<PostFormDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final _titleCtrl = TextEditingController(text: widget.initialTitle);
+  late final _bodyCtrl = TextEditingController(text: widget.initialBody);
+
+  @override
+  void dispose() {
+    _titleCtrl.dispose();
+    _bodyCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    String? required(String? v) => (v == null || v.trim().isEmpty) ? 'Required' : null;
+
+    return AlertDialog(
+      title: Text(widget.title),
+      content: Form(
+        key: _formKey,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextFormField(
+              controller: _titleCtrl,
+              decoration: const InputDecoration(labelText: 'Title'),
+              validator: required,
+            ),
+            TextFormField(
+              controller: _bodyCtrl,
+              decoration: const InputDecoration(labelText: 'Body'),
+              maxLines: 3,
+              validator: required,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              Navigator.pop(context, (_titleCtrl.text.trim(), _bodyCtrl.text.trim()));
+            }
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
